@@ -15,6 +15,7 @@ const app = new Hono();
 
 // Environment variables for API key protection and logging
 const API_KEY = process.env.PROXY_API_KEY || "default-key";
+const BAKONG_TOKEN = process.env.BAKONG_TOKEN; // Optional: attach auth for Bakong endpoints
 const BAKONG_API_URL = "https://api-bakong.nbc.gov.kh";
 const PORT = process.env.PORT || 3000;
 
@@ -81,6 +82,9 @@ app.all("*", async (c: Context) => {
       if (!skip.has(k.toLowerCase())) headers.set(k, v as string);
     }
     headers.set('host', 'api-bakong.nbc.gov.kh');
+    if (BAKONG_TOKEN && !headers.has('authorization')) {
+      headers.set('authorization', `Bearer ${BAKONG_TOKEN}`);
+    }
     // Explicitly set accept/content-type if missing
     if (!headers.has('accept')) headers.set('accept', 'application/json');
 

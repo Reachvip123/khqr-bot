@@ -25,7 +25,7 @@ BAKONG_MERCHANT_NAME = os.getenv("MERCHANT_NAME")
 # Optional: Proxy settings for Cambodia deployment
 BAKONG_PROXY_URL = os.getenv("BAKONG_PROXY_URL")  # e.g., "http://157.10.73.90:3000"
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")  # API key for proxy
-USE_PROXY = True
+USE_PROXY = True  # Forced proxy mode for network calls; QR generation can be local.
 # --- End of Configuration ---
 
 
@@ -110,6 +110,13 @@ def check_payment_via_proxy(md5):
 
 # --- KHQR Instance (used if no proxy) ---
 khqr_instance = None
+try:
+    # Initialize KHQR regardless of proxy so we can generate QR locally without network.
+    # This avoids Bakong IP restriction for creation while still proxying status checks.
+    khqr_instance = KHQR(BAKONG_API_TOKEN) if BAKONG_API_TOKEN else None
+except Exception as e:
+    logger.error(f"Failed to initialize KHQR instance for local QR generation: {e}")
+    khqr_instance = None
 
 # --- Bot Handlers ---
 
@@ -127,7 +134,10 @@ async def start(update: Update, context: CallbackContext) -> None:
 async def handle_message(update: Update, context: CallbackContext) -> None:
     """Handles incoming text messages to generate QR codes."""
     if not USE_PROXY:
-        await update.message.reply_text("⚠️ Proxy not configured. This bot requires the Cambodia proxy. Please set BAKONG_PROXY_URL & PROXY_API_KEY and redeploy.")
+        await update.message.reply_text("⚠️ Proxy not configured. Set BAKONG_PROXY_URL & PROXY_API_KEY.")
+        return
+    if not khqr_instance:
+        await update.message.reply_text("⚠️ KHQR library not initialized. Ensure BAKONG_TOKEN is set.")
         return
 
     message_text = update.message.text
@@ -148,11 +158,25 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
 
         await update.message.reply_text(f"⏳ Generating QR for {amount:,} {currency}...")
 
-        # 1. Generate QR via proxy only
-        logger.info(f"[BOT] Using proxy for QR creation")
-        qr_data, md5_hash = create_qr_via_proxy(amount, currency)
-        if not qr_data or not md5_hash:
-            await update.message.reply_text("Failed to create QR via proxy. Please try again.")
+        # 1. Generate QR locally using KHQR library (no network needed)
+        logger.info(f"[BOT] Generating QR locally via KHQR library")
+        try:
+            qr_data = khqr_instance.create_qr(
+                bank_account=BAKONG_ACCOUNT_ID,
+                merchant_name=BAKONG_MERCHANT_NAME,
+                merchant_city='Phnom Penh',
+                amount=amount,
+                currency=currency,
+                store_label='Dzstore',
+                phone_number='012345678',
+                terminal_label='Cashier01',
+                bill_number=f'TMX-{chat_id}-{update.message.message_id}'
+            )
+            md5_hash = khqr_instance.generate_md5(qr_data)
+            logger.info(f"[BOT] Generated MD5: {md5_hash}")
+        except Exception as e:
+            logger.error(f"[QR GEN ERROR] {e}")
+            await update.message.reply_text("Failed to generate QR locally. Check Bakong account ID & token.")
             return
 
         # 2. Create QR Code Image
@@ -195,8 +219,8 @@ async def check_payment_status(context: CallbackContext) -> None:
     try:
         logger.info(f"Checking payment for MD5: {data['md5']} (Attempt: {data['attempts'] + 1})")
         
-        # Use proxy only
-        logger.info(f"[PAYMENT CHECK] Using proxy")
+        # Use proxy only for payment status
+        logger.info(f"[PAYMENT CHECK] Using proxy for status")
         paid = check_payment_via_proxy(data['md5'])
 
         if paid:
