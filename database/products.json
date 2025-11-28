@@ -1,0 +1,13 @@
+{
+  "1": {
+    "name": "CAPCUT PRO",
+    "desc": "Premium Video Editor",
+    "sold": 0,
+    "variants": {
+      "1M": {
+        "name": "1 Month",
+        "price": 0.01
+      }
+    }
+  }
+}
