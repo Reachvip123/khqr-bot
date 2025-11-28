@@ -1,0 +1,5 @@
+python-telegram-bot
+requests
+bakong_khqr
+qrcode
+python-dotenv

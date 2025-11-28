@@ -1,0 +1,238 @@
+# -*- coding: utf-8 -*-
+import os
+import qrcode
+import logging
+import asyncio
+import requests
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+from bakong_khqr import KHQR
+from dotenv import load_dotenv
+
+# Load environment variables (local .env if present; Railway already provides envs)
+try:
+    load_dotenv()
+except Exception:
+    pass
+
+# --- ⚙️ YOUR DETAILS ⚙️ ---
+# Load from .env or use fallback values
+TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
+BAKONG_API_TOKEN = os.getenv("BAKONG_TOKEN")
+BAKONG_ACCOUNT_ID = os.getenv("BAKONG_ACCOUNT")
+BAKONG_MERCHANT_NAME = os.getenv("MERCHANT_NAME")
+
+# Optional: Proxy settings for Cambodia deployment
+BAKONG_PROXY_URL = os.getenv("BAKONG_PROXY_URL")  # e.g., "http://157.10.73.90:3000"
+PROXY_API_KEY = os.getenv("PROXY_API_KEY")  # API key for proxy
+USE_PROXY = True
+# --- End of Configuration ---
+
+
+# --- Logging Setup (for debugging) ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- Startup diagnostics to aid Railway deployment ---
+def _mask_token(t: str | None) -> str:
+    if not t:
+        return "MISSING"
+    return t[:6] + "…" + t[-4:]
+
+def print_startup_config():
+    print("\n[Startup] Environment configuration:")
+    print(f" - BOT_TOKEN:        {_mask_token(TELEGRAM_BOT_TOKEN)}")
+    print(f" - BAKONG_TOKEN:     {_mask_token(BAKONG_API_TOKEN)}")
+    print(f" - BAKONG_ACCOUNT:   {BAKONG_ACCOUNT_ID or 'MISSING'}")
+    print(f" - MERCHANT_NAME:    {BAKONG_MERCHANT_NAME or 'MISSING'}")
+    print(f" - PROXY_URL:        {BAKONG_PROXY_URL or 'None'}")
+    print(f" - PROXY_API_KEY:    {_mask_token(PROXY_API_KEY)}")
+    print(f" - USE_PROXY:        {USE_PROXY}")
+
+def validate_required_envs():
+    missing = []
+    if not TELEGRAM_BOT_TOKEN: missing.append("BOT_TOKEN")
+    if not BAKONG_API_TOKEN and not USE_PROXY:
+        # Bakong token is required when not using proxy
+        missing.append("BAKONG_TOKEN (required if not using proxy)")
+    if not BAKONG_ACCOUNT_ID: missing.append("BAKONG_ACCOUNT")
+    if not BAKONG_MERCHANT_NAME: missing.append("MERCHANT_NAME")
+    if USE_PROXY and not PROXY_API_KEY:
+        missing.append("PROXY_API_KEY (required when using proxy)")
+    if missing:
+        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+
+# --- Proxy Helper Functions ---
+def create_qr_via_proxy(amount, currency):
+    """Create QR via Cambodia proxy. Returns (qr_data, md5_hash)."""
+    try:
+        logger.info(f"[PROXY] Creating QR via proxy: {amount} {currency}")
+        url = f"{BAKONG_PROXY_URL}/v1/khqr/create"
+        headers = {"X-API-KEY": PROXY_API_KEY, "Content-Type": "application/json"}
+        params = {
+            "amount": amount,
+            "currency": currency,
+            "account": BAKONG_ACCOUNT_ID,
+            "merchant_name": BAKONG_MERCHANT_NAME,
+        }
+        res = requests.get(url, headers=headers, params=params, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        # Proxy returns: {qr_data: "...", md5: "..."} or similar structure
+        qr_data = data.get("qr") or data.get("qr_data")
+        md5_hash = data.get("md5") or data.get("hash")
+        logger.info(f"[PROXY QR] Created: MD5={md5_hash}")
+        return qr_data, md5_hash
+    except Exception as e:
+        logger.error(f"[PROXY QR ERROR] {e}")
+        return None, None
+
+def check_payment_via_proxy(md5):
+    """Check payment via Cambodia proxy. Returns True if paid, False otherwise."""
+    try:
+        logger.info(f"[PROXY CHECK] Checking payment for MD5: {md5}")
+        url = f"{BAKONG_PROXY_URL}/v1/khqr/check"
+        headers = {"X-API-KEY": PROXY_API_KEY}
+        params = {"md5": md5}
+        res = requests.get(url, headers=headers, params=params, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        # Proxy returns: {paid: true/false, ...}
+        paid = data.get("paid", False) or data.get("status") == "PAID"
+        logger.info(f"[PROXY CHECK] MD5={md5}, paid={paid}")
+        return paid
+    except Exception as e:
+        logger.error(f"[PROXY CHECK ERROR] {e}")
+        return False
+
+# --- KHQR Instance (used if no proxy) ---
+khqr_instance = None
+
+# --- Bot Handlers ---
+
+async def start(update: Update, context: CallbackContext) -> None:
+    """Sends a welcome message."""
+    welcome_text = (
+        "Welcome to the KHQR Bot!\n\n"
+        "To generate a QR code, send an amount.\n\n"
+        "✅ Examples:\n"
+        " • `2.50` (for USD)\n"
+        " • `10000 KHR` (for Riel)"
+    )
+    await update.message.reply_text(welcome_text)
+
+async def handle_message(update: Update, context: CallbackContext) -> None:
+    """Handles incoming text messages to generate QR codes."""
+    if not USE_PROXY:
+        await update.message.reply_text("⚠️ Proxy not configured. This bot requires the Cambodia proxy. Please set BAKONG_PROXY_URL & PROXY_API_KEY and redeploy.")
+        return
+
+    message_text = update.message.text
+    chat_id = update.message.chat_id
+
+    try:
+        parts = message_text.split()
+        amount_str = parts[0].replace(',', '')
+        amount = float(amount_str)
+        currency = "USD"
+        if len(parts) > 1 and parts[1].upper() == 'KHR':
+            currency = "KHR"
+            amount = int(amount)
+
+        if amount <= 0:
+            await update.message.reply_text("Please enter an amount greater than zero.")
+            return
+
+        await update.message.reply_text(f"⏳ Generating QR for {amount:,} {currency}...")
+
+        # 1. Generate QR via proxy only
+        logger.info(f"[BOT] Using proxy for QR creation")
+        qr_data, md5_hash = create_qr_via_proxy(amount, currency)
+        if not qr_data or not md5_hash:
+            await update.message.reply_text("Failed to create QR via proxy. Please try again.")
+            return
+
+        # 2. Create QR Code Image
+        image_path = os.path.join(os.getcwd(), f"qr_{md5_hash}.png")
+        qrcode.make(qr_data).save(image_path)
+
+        # 3. Send QR Code to User
+        with open(image_path, 'rb') as qr_photo:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=qr_photo,
+                caption=f"Please scan to pay {amount:,} {currency}.\nI will notify you when payment is complete."
+            )
+        os.remove(image_path)  # Clean up the image file
+
+        # 4. Start checking for payment in the background
+        context.job_queue.run_once(
+            check_payment_status,
+            when=10,  # Start checking after 10 seconds
+            data={'chat_id': chat_id, 'md5': md5_hash, 'amount': amount, 'currency': currency, 'attempts': 0},
+            name=f"payment_{md5_hash}"
+        )
+
+    except (ValueError, IndexError):
+        await update.message.reply_text("Invalid format. Please send the amount like `2.50` or `10000 KHR`.")
+    except Exception as e:
+        logger.error(f"An error occurred in handle_message: {e}")
+        await update.message.reply_text("Sorry, an unexpected error occurred. Please try again.")
+
+async def check_payment_status(context: CallbackContext) -> None:
+    """Periodically checks if the transaction has been paid."""
+    job = context.job
+    data = job.data
+    max_attempts = 36  # Check for 6 minutes (36 attempts * 10 seconds)
+
+    if data['attempts'] >= max_attempts:
+        await context.bot.send_message(chat_id=data['chat_id'], text=f"The payment request for {data['amount']:,} {data['currency']} has expired.")
+        return
+
+    try:
+        logger.info(f"Checking payment for MD5: {data['md5']} (Attempt: {data['attempts'] + 1})")
+        
+        # Use proxy only
+        logger.info(f"[PAYMENT CHECK] Using proxy")
+        paid = check_payment_via_proxy(data['md5'])
+
+        if paid:
+            logger.info(f"Payment successful for MD5: {data['md5']}")
+            await context.bot.send_message(
+                chat_id=data['chat_id'],
+                text=f"✅ Payment Received!\n\nThank you for paying {data['amount']:,} {data['currency']}."
+            )
+        else:
+            data['attempts'] += 1
+            context.job_queue.run_once(check_payment_status, when=10, data=data, name=job.name)
+
+    except Exception as e:
+        logger.error(f"Error checking payment status for MD5 {data['md5']}: {e}")
+        if data['attempts'] > 5:
+            await context.bot.send_message(chat_id=data['chat_id'], text="There was an issue verifying your payment. Please contact support if you have already paid.")
+
+def main() -> None:
+    """Starts the bot."""
+    # Validate envs early for clear Railway errors
+    print_startup_config()
+    validate_required_envs()
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    if USE_PROXY:
+        print(f"\nBot is running with KHQR PROXY enabled!")
+        print(f"Proxy URL: {BAKONG_PROXY_URL}")
+    else:
+        print(f"\nProxy is not configured. Set BAKONG_PROXY_URL & PROXY_API_KEY.")
+    
+    print("Press Ctrl+C to stop.")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
+
