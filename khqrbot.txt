@@ -36,6 +36,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def debug_env():
+    logger.info("[DEBUG ENV] ACCOUNT=%s MERCHANT=%s TOKEN_SET=%s PROXY_URL=%s", 
+                BAKONG_ACCOUNT_ID, BAKONG_MERCHANT_NAME, bool(BAKONG_API_TOKEN), BAKONG_PROXY_URL)
+
 # --- Startup diagnostics to aid Railway deployment ---
 def _mask_token(t: str | None) -> str:
     if not t:
@@ -144,6 +148,7 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
     chat_id = update.message.chat_id
 
     try:
+        debug_env()
         parts = message_text.split()
         amount_str = parts[0].replace(',', '')
         amount = float(amount_str)
@@ -175,8 +180,14 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
             md5_hash = khqr_instance.generate_md5(qr_data)
             logger.info(f"[BOT] Generated MD5: {md5_hash}")
         except Exception as e:
-            logger.error(f"[QR GEN ERROR] {e}")
-            await update.message.reply_text("Failed to generate QR locally. Check Bakong account ID & token.")
+            logger.exception(f"[QR GEN ERROR] {e}")
+            await update.message.reply_text(
+                "QR generation failed. Possible issues:\n"
+                " - Bakong account format invalid (use numeric ID).\n"
+                " - Token missing or expired.\n"
+                " - Amount/currency unsupported.\n"
+                "Please verify and resend."
+            )
             return
 
         # 2. Create QR Code Image
@@ -201,10 +212,12 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
         )
 
     except (ValueError, IndexError):
-        await update.message.reply_text("Invalid format. Please send the amount like `2.50` or `10000 KHR`.")
+        await update.message.reply_text("Invalid format. Send amount like `2.50` or `10000 KHR`.")
     except Exception as e:
-        logger.error(f"An error occurred in handle_message: {e}")
-        await update.message.reply_text("Sorry, an unexpected error occurred. Please try again.")
+        logger.exception(f"[UNEXPECTED ERROR] {e}")
+        await update.message.reply_text(
+            "Unexpected error. Causes may include missing env vars or network issues. Check logs for [UNEXPECTED ERROR]."
+        )
 
 async def check_payment_status(context: CallbackContext) -> None:
     """Periodically checks if the transaction has been paid."""
