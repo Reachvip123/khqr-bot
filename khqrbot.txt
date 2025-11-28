@@ -26,7 +26,7 @@ BAKONG_MERCHANT_NAME = os.getenv("MERCHANT_NAME")
 # Optional: Proxy settings for Cambodia deployment
 BAKONG_PROXY_URL = os.getenv("BAKONG_PROXY_URL")  # e.g., "http://157.10.73.90:3000"
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")  # API key for proxy
-USE_PROXY = True  # Forced proxy mode for network calls; QR generation can be local.
+USE_PROXY = True  # Prefer proxy for Bakong API calls
 # --- End of Configuration ---
 
 
@@ -164,32 +164,37 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
 
         await update.message.reply_text(f"⏳ Generating QR for {amount:,} {currency}...")
 
-        # 1. Generate QR locally using KHQR library (no network needed)
-        logger.info(f"[BOT] Generating QR locally via KHQR library")
-        try:
-            qr_data = khqr_instance.create_qr(
-                bank_account=BAKONG_ACCOUNT_ID,
-                merchant_name=BAKONG_MERCHANT_NAME,
-                merchant_city='Phnom Penh',
-                amount=amount,
-                currency=currency,
-                store_label='Dzstore',
-                phone_number='012345678',
-                terminal_label='Cashier01',
-                bill_number=f'TMX-{chat_id}-{update.message.message_id}'
-            )
-            md5_hash = khqr_instance.generate_md5(qr_data)
-            logger.info(f"[BOT] Generated MD5: {md5_hash}")
-        except Exception as e:
-            logger.exception(f"[QR GEN ERROR] {e}")
-            await update.message.reply_text(
-                "QR generation failed. Possible issues:\n"
-                " - Bakong account format invalid (use numeric ID).\n"
-                " - Token missing or expired.\n"
-                " - Amount/currency unsupported.\n"
-                "Please verify and resend."
-            )
-            return
+        # 1. Try proxy QR creation first
+        qr_data = None
+        md5_hash = None
+        proxy_attempted = False
+        if USE_PROXY and BAKONG_PROXY_URL and PROXY_API_KEY:
+            proxy_attempted = True
+            logger.info("[BOT] Attempting proxy QR creation")
+            qr_data, md5_hash = create_qr_via_proxy(amount, currency)
+        if not qr_data or not md5_hash:
+            if proxy_attempted:
+                logger.warning("[BOT] Proxy QR failed; falling back to local KHQR generation (payment status may not work).")
+            try:
+                qr_data = khqr_instance.create_qr(
+                    bank_account=BAKONG_ACCOUNT_ID,
+                    merchant_name=BAKONG_MERCHANT_NAME,
+                    merchant_city='Phnom Penh',
+                    amount=amount,
+                    currency=currency,
+                    store_label='Dzstore',
+                    phone_number='012345678',
+                    terminal_label='Cashier01',
+                    bill_number=f'TMX-{chat_id}-{update.message.message_id}'
+                )
+                md5_hash = khqr_instance.generate_md5(qr_data)
+                logger.info(f"[BOT] Local QR MD5: {md5_hash}")
+            except Exception as e:
+                logger.exception(f"[QR GEN ERROR] {e}")
+                await update.message.reply_text(
+                    "QR generation failed. Check numeric Bakong account, token validity, and amount."
+                )
+                return
 
         # 2. Create QR Code Image
         image_path = os.path.join(os.getcwd(), f"qr_{md5_hash}.png")
@@ -204,13 +209,18 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
             )
         os.remove(image_path)  # Clean up the image file
 
-        # 4. Start checking for payment in the background
-        context.job_queue.run_once(
-            check_payment_status,
-            when=10,  # Start checking after 10 seconds
-            data={'chat_id': chat_id, 'md5': md5_hash, 'amount': amount, 'currency': currency, 'attempts': 0},
-            name=f"payment_{md5_hash}"
-        )
+        # 4. Start checking for payment only if proxy QR succeeded (md5 came from proxy path)
+        if proxy_attempted and USE_PROXY and BAKONG_PROXY_URL and PROXY_API_KEY and qr_data and md5_hash:
+            context.job_queue.run_once(
+                check_payment_status,
+                when=10,
+                data={'chat_id': chat_id, 'md5': md5_hash, 'amount': amount, 'currency': currency, 'attempts': 0},
+                name=f"payment_{md5_hash}"
+            )
+        else:
+            await update.message.reply_text(
+                "ℹ️ QR generated locally without proxy registration; automatic payment confirmation disabled."
+            )
 
     except (ValueError, IndexError):
         await update.message.reply_text("Invalid format. Send amount like `2.50` or `10000 KHR`.")
