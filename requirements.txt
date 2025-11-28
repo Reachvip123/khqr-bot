@@ -3,3 +3,4 @@ requests
 bakong_khqr
 qrcode
 python-dotenv
+Pillow
